@@ -41,6 +41,7 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -166,8 +167,11 @@ namespace RobotLocalization
 
     clearMeasurementQueue();
 
-    filterStateHistory_.clear();
-    measurementHistory_.clear();
+    {
+      std::lock_guard<std::recursive_mutex> lock(historyMutex_);
+      filterStateHistory_.clear();
+      measurementHistory_.clear();
+    }
 
     // Also set the last set pose time, so we ignore all messages
     // that occur before it
@@ -202,6 +206,72 @@ namespace RobotLocalization
       resp.status = true;
     }
     return true;
+  }
+
+  template<typename T>
+  bool RosFilter<T>::clearTopicDataCallback(robot_localization::ClearTopicData::Request& req,
+                                            robot_localization::ClearTopicData::Response& resp)
+  {
+    auto topicIt = topicToTopicName_.find(req.topic);
+    if (topicIt == topicToTopicName_.end())
+    {
+      ROS_ERROR_STREAM("Service was called to clear topic data on topic " << req.topic << ", but that topic is not in the configuration.");
+      resp.success = false;
+      return false;
+    }
+
+    const std::string &topicName = topicIt->second;
+
+    std::lock_guard<std::recursive_mutex> lock(measurementMutex_);
+    std::lock_guard<std::recursive_mutex> lock2(historyMutex_);
+    
+    const ros::Time now = ros::Time::now();
+    ROS_WARN("Clearing data for topic with name %s starting at time %.2f (%.2f seconds ago)", topicName.c_str(), req.starting_time.toSec(), (now - req.starting_time).toSec());
+
+    // Go throught the measurement queue and measurement history, and remove any measurements
+    // that are associated with the topic and are newer than the starting time.
+    unsigned numMeasurementsErased = 0;
+    MeasurementQueue newMeasurementQueue;
+    while (!measurementQueue_.empty())
+    {
+      auto measurement = measurementQueue_.top();
+      measurementQueue_.pop();
+      // If the topic name (e.g. imu0_twist) starts with the topic name (e.g. imu0) we're looking for, and the measurement time is
+      // greater than the starting time, then we want to remove it.
+      if (measurement->topicName_.rfind(topicName, 0) == 0 && measurement->time_ >= req.starting_time.toSec())
+      {
+        ++numMeasurementsErased;
+      }
+      else
+      {
+        newMeasurementQueue.push(measurement);
+      }
+    }
+    measurementQueue_ = newMeasurementQueue;
+
+    unsigned numHistoryErased = 0;
+    for (auto it = measurementHistory_.begin(); it != measurementHistory_.end();)
+    {
+      // If the topic name (e.g. imu0_twist) starts with the topic name (e.g. imu0) we're looking for, and the measurement time is
+      // greater than the starting time, then we want to remove it.
+      if ((*it)->topicName_.rfind(topicName, 0) == 0 && (*it)->time_ >= req.starting_time.toSec())
+      {
+        it = measurementHistory_.erase(it);
+        ++numHistoryErased;
+      }
+      else
+      {
+        ++it;
+      }
+    }
+
+    ROS_WARN("Erased %u measurement(s) from the queue and %u measurement(s) from the history", numMeasurementsErased, numHistoryErased);
+
+    const bool success = revertTo(req.starting_time.toSec());
+    resp.success = success;
+
+    ROS_WARN("Clearing data was %s", success ? "successful" : "UNSUCCESSFUL");
+    return success;
   }
 
   // @todo: Replace with AccelWithCovarianceStamped
@@ -339,6 +409,9 @@ namespace RobotLocalization
     meas->mahalanobisThresh_ = mahalanobisThresh;
     meas->latestControl_ = latestControl_;
     meas->latestControlTime_ = latestControlTime_.toSec();
+    
+    std::lock_guard<std::recursive_mutex> lock(measurementMutex_);
+
     measurementQueue_.push(meas);
   }
 
@@ -597,6 +670,8 @@ namespace RobotLocalization
   {
     const double currentTimeSec = currentTime.toSec();
 
+    std::lock_guard<std::recursive_mutex> lock(measurementMutex_);
+
     RF_DEBUG("------ RosFilter::integrateMeasurements ------\n\n"
              "Integration time is " << std::setprecision(20) << currentTimeSec << "\n"
              << measurementQueue_.size() << " measurements in queue.\n");
@@ -662,8 +737,10 @@ namespace RobotLocalization
         filter_.processMeasurement(*(measurement.get()));
 
         // Store old states and measurements if we're smoothing
-        if (smoothLaggedData_)
+        if (::fabs(historyLength_) > 1e-9)
         {
+          std::lock_guard<std::recursive_mutex> lock(historyMutex_);
+
           // Invariant still holds: measurementHistoryDeque_.back().time_ < measurementQueue_.top().time_
           measurementHistory_.push_back(measurement);
 
@@ -715,6 +792,8 @@ namespace RobotLocalization
   template<typename T>
   void RosFilter<T>::differentiateMeasurements(const ros::Time &currentTime)
   {
+    std::lock_guard<std::recursive_mutex> lock(measurementMutex_);
+
     if (filter_.getInitializedStatus())
     {
       const double dt = (currentTime - lastDiffTime_).toSec();
@@ -891,12 +970,6 @@ namespace RobotLocalization
     // Wether we reset filter on jump back in time
     nhLocal_.param("reset_on_time_jump", resetOnTimeJump_, false);
 
-    if (!smoothLaggedData_ && ::fabs(historyLength_) > 1e-9)
-    {
-      ROS_WARN_STREAM("Filter history interval of " << historyLength_ <<
-                      " specified, but smooth_lagged_data is set to false. Lagged data will not be smoothed.");
-    }
-
     if (smoothLaggedData_ && historyLength_ < -1e9)
     {
       ROS_WARN_STREAM("Negative history interval of " << historyLength_ <<
@@ -1068,6 +1141,9 @@ namespace RobotLocalization
     toggleFilterProcessingSrv_ =
       nhLocal_.advertiseService("toggle", &RosFilter<T>::toggleFilterProcessingCallback, this);
 
+    // Create a service for clearing topic data
+    clearTopicDataSrv_ = nhLocal_.advertiseService("clear_topic_data", &RosFilter<T>::clearTopicDataCallback, this);
+
     // Init the last measurement time so we don't get a huge initial delta
     filter_.setLastMeasurementTime(ros::Time::now().toSec());
 
@@ -1109,6 +1185,7 @@ namespace RobotLocalization
 
           std::string odomTopic;
         nhLocal_.getParam(odomTopicName, odomTopic);
+        topicToTopicName_[odomTopic] = odomTopicName;
 
         // Check for pose rejection threshold
         double poseMahalanobisThresh;
@@ -1236,6 +1313,7 @@ namespace RobotLocalization
 
         std::string poseTopic;
         nhLocal_.getParam(poseTopicName, poseTopic);
+        topicToTopicName_[poseTopic] = poseTopicName;
 
         // Check for pose rejection threshold
         double poseMahalanobisThresh;
@@ -1319,6 +1397,7 @@ namespace RobotLocalization
       {
         std::string twistTopic;
         nhLocal_.getParam(twistTopicName, twistTopic);
+        topicToTopicName_[twistTopic] = twistTopicName;
 
         // Check for twist rejection threshold
         double twistMahalanobisThresh;
@@ -1399,6 +1478,7 @@ namespace RobotLocalization
 
         std::string imuTopic;
         nhLocal_.getParam(imuTopicName, imuTopic);
+        topicToTopicName_[imuTopic] = imuTopicName;
 
         // Check for pose rejection threshold
         double poseMahalanobisThresh;
@@ -1939,6 +2019,7 @@ namespace RobotLocalization
 
     if (toggledOn_)
     {
+      std::lock_guard<std::recursive_mutex> lock(measurementMutex_);
       // Now we'll integrate any measurements we've received if requested, and update angular acceleration.
       integrateMeasurements(curTime);
       differentiateMeasurements(curTime);
@@ -2086,7 +2167,7 @@ namespace RobotLocalization
     }
 
     // Clear out expired history data
-    if (smoothLaggedData_)
+    if (::fabs(historyLength_) > 1e-9)
     {
       clearExpiredHistory(filter_.getLastMeasurementTime() - historyLength_);
     }
@@ -2108,8 +2189,11 @@ namespace RobotLocalization
 
     clearMeasurementQueue();
 
-    filterStateHistory_.clear();
-    measurementHistory_.clear();
+    {
+      std::lock_guard<std::recursive_mutex> lock(historyMutex_);
+      filterStateHistory_.clear();
+      measurementHistory_.clear();
+    }
 
     // Also set the last set pose time, so we ignore all messages
     // that occur before it
@@ -3223,6 +3307,8 @@ namespace RobotLocalization
     state->lastMeasurementTime_ = filter.getLastMeasurementTime();
     state->latestControl_ = Eigen::VectorXd(filter.getControl());
     state->latestControlTime_ = filter.getControlTime();
+    
+    std::lock_guard<std::recursive_mutex> lock(historyMutex_);
     filterStateHistory_.push_back(state);
     RF_DEBUG("Saved state with timestamp " << std::setprecision(20) << state->lastMeasurementTime_ <<
              " to history. " << filterStateHistory_.size() << " measurements are in the queue.\n");
@@ -3231,14 +3317,19 @@ namespace RobotLocalization
   template<typename T>
   bool RosFilter<T>::revertTo(const double time)
   {
-    RF_DEBUG("\n----- RosFilter::revertTo -----\n");
-    RF_DEBUG("\nRequested time was " << std::setprecision(20) << time << "\n")
+    ROS_WARN_STREAM("\n----- RosFilter::revertTo -----\n");
+    ROS_WARN_STREAM("\nRequested time was " << std::setprecision(20) << time << "\n");
+
+    std::lock_guard<std::recursive_mutex> lock(historyMutex_);
+    std::lock_guard<std::recursive_mutex> lock2(measurementMutex_);
 
     size_t history_size = filterStateHistory_.size();
 
+    ROS_WARN_STREAM("\nHistory size is " << history_size << "\n");
+
     // Walk back through the queue until we reach a filter state whose time stamp is less than or equal to the
     // requested time. Since every saved state after that time will be overwritten/corrected, we can pop from
-    // the queue. If the history is insufficiently short, we just take the oldest state we have.
+    // the queue. If the history is insufficiently long, we just take the oldest state we have.
     FilterStatePtr lastHistoryState;
     while (!filterStateHistory_.empty() && filterStateHistory_.back()->lastMeasurementTime_ > time)
     {
@@ -3246,7 +3337,7 @@ namespace RobotLocalization
       filterStateHistory_.pop_back();
     }
 
-    // If the state history is not empty at this point, it means that our history was large enough, and we
+    // If the state history is not empty at this point, it means that our history was long enough, and we
     // should revert to the state at the back of the history deque.
     bool retVal = false;
     if (!filterStateHistory_.empty())
@@ -3256,11 +3347,11 @@ namespace RobotLocalization
     }
     else
     {
-      RF_DEBUG("Insufficient history to revert to time " << time << "\n");
+      ROS_WARN_STREAM("Insufficient history to revert to time " << time << "\n");
 
       if (lastHistoryState)
       {
-        RF_DEBUG("Will revert to oldest state at " << lastHistoryState->latestControlTime_ << ".\n");
+        ROS_WARN_STREAM("Will revert to oldest state at " << lastHistoryState->lastMeasurementTime_ << ".\n");
         ROS_WARN_STREAM_DELAYED_THROTTLE(historyLength_, "Could not revert to state with time " <<
           std::setprecision(20) << time << ". Instead reverted to state with time " <<
           lastHistoryState->lastMeasurementTime_ << ". History size was " << history_size);
@@ -3276,7 +3367,7 @@ namespace RobotLocalization
       filter_.setEstimateErrorCovariance(state->estimateErrorCovariance_);
       filter_.setLastMeasurementTime(state->lastMeasurementTime_);
 
-      RF_DEBUG("Reverted to state with time " << std::setprecision(20) << state->lastMeasurementTime_ << "\n");
+      ROS_WARN_STREAM("Reverted to state with time " << std::setprecision(20) << state->lastMeasurementTime_ << "\n");
 
       // Repeat for measurements, but push every measurement onto the measurement queue as we go
       int restored_measurements = 0;
@@ -3292,10 +3383,10 @@ namespace RobotLocalization
         measurementHistory_.pop_back();
       }
 
-      RF_DEBUG("Restored " << restored_measurements << " to measurement queue.\n");
+      ROS_WARN_STREAM("Restored " << restored_measurements << " to measurement queue.\n");
     }
 
-    RF_DEBUG("\n----- /RosFilter::revertTo\n");
+    ROS_WARN_STREAM("\n----- /RosFilter::revertTo\n");
 
     return retVal;
   }
@@ -3324,6 +3415,8 @@ namespace RobotLocalization
     RF_DEBUG("\n----- RosFilter::clearExpiredHistory -----" <<
              "\nCutoff time is " << cutOffTime << "\n");
 
+    std::lock_guard<std::recursive_mutex> lock(historyMutex_);
+
     int poppedMeasurements = 0;
     int poppedStates = 0;
 
@@ -3347,6 +3440,8 @@ namespace RobotLocalization
   template<typename T>
   void RosFilter<T>::clearMeasurementQueue()
   {
+    std::lock_guard<std::recursive_mutex> lock(measurementMutex_);
+
     while (!measurementQueue_.empty() && ros::ok())
     {
       measurementQueue_.pop();

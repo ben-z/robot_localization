@@ -39,6 +39,7 @@
 
 #include <robot_localization/SetPose.h>
 #include <robot_localization/ToggleFilterProcessing.h>
+#include <robot_localization/ClearTopicData.h>
 
 #include <ros/ros.h>
 #include <std_msgs/String.h>
@@ -66,6 +67,7 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <queue>
 #include <string>
@@ -147,6 +149,10 @@ template<class T> class RosFilter
     //! @return boolean true if successful, false if not
     bool toggleFilterProcessingCallback(robot_localization::ToggleFilterProcessing::Request&,
                                         robot_localization::ToggleFilterProcessing::Response&);
+
+    //! @brief Service callback to clear data from a topic
+    bool clearTopicDataCallback(robot_localization::ClearTopicData::Request&,
+                                robot_localization::ClearTopicData::Response&);
 
     //! @brief Callback method for receiving all acceleration (IMU) messages
     //! @param[in] msg - The ROS IMU message to take in.
@@ -619,6 +625,9 @@ template<class T> class RosFilter
     //!
     std::map<std::string, std::string> staticDiagnostics_;
 
+    //! @brief Stores the topic names (e.g. imu0_twist) for each topic (e.g. /imu/data)
+    std::map<std::string, std::string> topicToTopicName_;
+
     //! @brief Last time mark that time-differentiation is calculated
     //!
     ros::Time lastDiffTime_;
@@ -681,6 +690,10 @@ template<class T> class RosFilter
     //!
     ros::ServiceServer toggleFilterProcessingSrv_;
 
+    //! @brief Service that allows another node to clear the filter's topic data.
+    //! Uses a robot_localization ClearTopicData service.
+    ros::ServiceServer clearTopicDataSrv_;
+
     //! @brief timer calling periodicUpdate
     //!
     ros::Timer periodicUpdateTimer_;
@@ -697,11 +710,17 @@ template<class T> class RosFilter
     // back() refers to the measurement with the latest timestamp.
     MeasurementHistoryDeque measurementHistory_;
 
+    //! @brief Mutex for the filter state and measurement history
+    std::recursive_mutex historyMutex_;
+
     //! @brief We process measurements by queueing them up in
     //! callbacks and processing them all at once within each
     //! iteration
     //!
     MeasurementQueue measurementQueue_;
+
+    //! @brief Mutex for the measurement queue
+    std::recursive_mutex measurementMutex_;
 
     //! @brief Our filter (EKF, UKF, etc.)
     //!

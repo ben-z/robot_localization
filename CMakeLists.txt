@@ -69,6 +69,7 @@ add_service_files(
     ToggleFilterProcessing.srv
     FromLL.srv
     ToLL.srv
+    ClearTopicData.srv
 )
 
 generate_messages(

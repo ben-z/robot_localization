@@ -1,0 +1,11 @@
+# This service is used to clear the data of a topic.
+# Data of the other topics will not be affected.
+# This is useful when you think that the filter received some faulty data
+
+string topic
+time starting_time # The time after which the data will be deleted
+
+---
+
+# The result of the service call
+bool success
